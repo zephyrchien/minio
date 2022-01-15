@@ -313,6 +313,9 @@ namespace epoll {
             void await_resume() noexcept {
                 auto& poller = Poller::instance();
                 poller.remove(fd);
+                if (ev & EPOLLOUT) {
+                    close(fd);
+                }
             }
         };
 
