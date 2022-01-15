@@ -328,12 +328,27 @@ namespace epoll {
         }
     }
 
+    enum class Mode {
+        LT = 0,
+        ET = 1
+    };
+
+    template<Mode mode = Mode::LT>
     auto readable(int fd) noexcept {
-        return ready(fd, EPOLLIN);
+        if constexpr (mode == Mode::ET) {
+            return ready(fd, EPOLLIN|EPOLLET);
+        } else {
+            return ready(fd, EPOLLIN);
+        }
     }
 
+    template<Mode mode = Mode::LT>
     auto writable(int fd) noexcept {
-        return ready(fd, EPOLLOUT);
+        if constexpr (mode == Mode::ET) {
+            return ready(fd, EPOLLOUT|EPOLLET);
+        } else {
+            return ready(fd, EPOLLOUT);
+        }
     }
 
     using coro::Task;
