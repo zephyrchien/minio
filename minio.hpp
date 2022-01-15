@@ -159,7 +159,13 @@ namespace detail {
     }
 }
 
-template<typename T>
+// affect initial_suspend
+enum class Mode {
+    LAZY = 0,
+    EAGER = 1
+};
+
+template<typename T, Mode mode = Mode::LAZY>
 struct Task {
     struct Promise;
     using promise_type = Promise;
@@ -185,8 +191,11 @@ struct Task {
             std::terminate();
         }
 
-        // this is a lazy coroutine!!
-        constexpr suspend_always 
+        // this is a lazy coroutine by default!!
+        constexpr std::conditional_t<
+            mode==Mode::LAZY,
+            suspend_always,
+            suspend_never>
         initial_suspend() const noexcept { return {}; }
         
         FinalAwaiter final_suspend() const noexcept { return {}; }
