@@ -66,6 +66,7 @@ namespace detail {
             T value;
             State state = State::Pending;
 
+            // co_return value
             void return_value(T&& value) && noexcept {
                 this->value = std::move(value);
                 this->state = State::Ready;
@@ -76,6 +77,8 @@ namespace detail {
                 this->state = State::Ready;
             }
 
+            // must within the coroutine's lifetime
+            // the coroutine should be suspended at final_suspend
             T& get_result() & noexcept {
                 return value;
             }
@@ -98,20 +101,20 @@ namespace detail {
 
         template<typename Promise>
         struct FinalAwaiterBase {
-            // alwyas suspend, requires manually release resource if detached
+            // alwyas suspend
+            // manually delete coroutine frame if detached
             constexpr bool await_ready() const noexcept { return false; }
 
-            // nothing todo, this coroutine will no longer be executed
+            // nothing todo, the promise is fulfilled
             void await_resume() const noexcept {};
 
-            // go back to outer coroutine
-            // and release resource if detached
             coroutine_handle<>
             await_suspend(coroutine_handle<Promise> handle) noexcept {
                 auto& promise = handle.promise();
                 auto super_handle = promise.super_handle;
                 auto state = promise.state;
 
+                // go back to outer coroutine
                 if (state != State::Detach) {
                     return super_handle ? super_handle : noop_coroutine();
                 }
@@ -130,6 +133,8 @@ namespace detail {
 
             constexpr bool await_ready() const noexcept { return false; }
 
+            // save outer coroutine handler
+            // and execute inner coroutine
             coroutine_handle<Promise>
             await_suspend(coroutine_handle<> super_handle) noexcept {
                 this_handle.promise().super_handle = super_handle;
@@ -137,6 +142,7 @@ namespace detail {
             }
         };
 
+        // return value of co_return
         template<typename T, typename Promise>
         struct AwaiterBase: Base<Promise> {
             T&& await_resume() noexcept {
@@ -179,20 +185,20 @@ struct Task {
             std::terminate();
         }
 
-        // this is a lazy coroutine, should be executed later
-        constexpr suspend_always initial_suspend() const noexcept {
-            return {}; 
-        }
+        // this is a lazy coroutine!!
+        constexpr suspend_always 
+        initial_suspend() const noexcept { return {}; }
         
         FinalAwaiter final_suspend() const noexcept { return {}; }
     };
     
+    // make the task itself awaitable, aka nested task
     using Awaiter = detail::task_awaiter::AwaiterBase<T, promise_type>;
     Awaiter operator co_await() noexcept {
         return { this_handle };
     }
 
-
+    // may cause memory leak if the coroutine is not resumed
     void detach() noexcept {
         using State = detail::promise::State;
         if (this_handle == nullptr) return;
@@ -211,7 +217,7 @@ struct Task {
         rhs.this_handle = nullptr;
     }
     ~Task() noexcept {
-        // detached, release after final_suspend
+        // detached or moved
         if (!this_handle) return;
 
         // release coroutine frame
