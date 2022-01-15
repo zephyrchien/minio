@@ -71,7 +71,7 @@ namespace detail {
                 this->state = State::Ready;
             }
 
-            void return_value(const T& value) noexcept {
+            void return_value(const T& value) & noexcept {
                 this->value = value;
                 this->state = State::Ready;
             }
