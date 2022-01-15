@@ -52,6 +52,6 @@ Task<void>echo()
 
 int main()
 {
-    epoll::block_on(echo());
+    minio::block_on(echo());
     cout << "exit" << endl;
 }

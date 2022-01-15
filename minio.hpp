@@ -364,5 +364,6 @@ using coro::this_coro;
 
 using epoll::readable;
 using epoll::writable;
+using epoll::block_on;
 
 MINIO_NS_END

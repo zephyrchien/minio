@@ -47,6 +47,6 @@ Task<int> xconnect()
 
 int main()
 {
-    auto n = epoll::block_on(xconnect());
+    auto n = minio::block_on(xconnect());
     cout << "recv " << n << " bytes" << endl;   
 }

@@ -89,6 +89,6 @@ Task<void> proxy()
 
 int main()
 {
-    epoll::block_on(proxy());
+    minio::block_on(proxy());
     cout << "exit" << endl;
 }
