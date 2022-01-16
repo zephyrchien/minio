@@ -265,11 +265,8 @@ namespace epoll {
     struct Poller {
         const int epfd;
         int count = 0;
-        vector<epoll_event> events;
 
-        Poller() noexcept: epfd(epoll_create1(0)) {
-            events.reserve(256);
-        }
+        Poller() noexcept: epfd(epoll_create1(0)) {}
 
         Poller(const Poller&) = delete;
         Poller& operator=(const Poller&) = delete;
@@ -294,9 +291,15 @@ namespace epoll {
         }
 
         void start_loop() noexcept {
-            auto evdata = events.data();
+            vector<epoll_event> events{};
+            events.reserve(1024);
+
             while(count > 0) {
+                events.resize(count);
+                auto evdata = events.data();
+                
                 int nfds = epoll_wait(epfd, evdata, count, -1);
+
                 for(int i = 0; i < nfds; ++i) {
                     auto ev = evdata[i];
                     auto handle = coroutine_handle<>::from_address(ev.data.ptr);
