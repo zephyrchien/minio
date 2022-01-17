@@ -1,9 +1,11 @@
 #pragma once
 
 #include <coroutine>
+#include <concepts>
 #include <utility>
 #include <exception>
 #include <vector>
+#include <list>
 #include <cstdint>
 #include <cassert>
 #include <unistd.h>
@@ -19,12 +21,67 @@ using std::noop_coroutine;
 
 using std::uint32_t;
 using std::vector;
+using std::list;
 
 #define MINIO_NS_BEG namespace minio {
 #define MINIO_NS_END }
 
 
 MINIO_NS_BEG
+
+namespace concepts {
+    template<typename T>
+    concept AsRawFd = requires(T x, uint32_t ev) {
+        { x.as_raw_fd() } -> std::same_as<int>;
+        { x.is_registered() } -> std::same_as<bool>;
+        { x.is_ready(ev) } -> std::same_as<bool>;
+        x.set_readiness(ev);
+        x.clear_readiness(ev);
+    };
+}
+
+
+
+
+namespace sys {
+    struct RawFd {
+        struct State {
+            unsigned int owned: 1;
+            unsigned int registered: 1;
+        };
+
+        int fd;
+        State state;
+        uint32_t ev;
+
+        explicit RawFd(int fd) noexcept: fd(fd), state({1,0}), ev(0) {}
+        RawFd(const RawFd&) = delete;
+        RawFd& operator=(const RawFd&) = delete;
+        RawFd(RawFd&& rawfd) noexcept: 
+            fd(rawfd.fd), state(rawfd.state), ev(rawfd.ev) {
+            rawfd.fd = -1;
+            rawfd.state.owned = 0;
+        }
+        RawFd& operator=(RawFd&& rawfd) noexcept {
+            fd = rawfd.fd;
+            state = rawfd.state;
+            rawfd.fd = -1;
+            rawfd.state.owned = 0;
+            return *this;
+        }
+        ~RawFd() noexcept {
+            if(fd > 0 && state.owned) close(fd);
+        }
+
+        // impl AsRawFd
+        int as_raw_fd() const noexcept { return fd; }
+        bool is_registered() const noexcept { return state.registered; }
+        bool is_ready(uint32_t ex) const noexcept { return ev & ex; }
+        void set_readiness(uint32_t ex) noexcept { ev |= ex; }
+        void clear_readiness(uint32_t ex) noexcept { ev &= ~ex; }
+    };
+}
+
 
 
 namespace utils {
@@ -262,32 +319,48 @@ auto this_coro() noexcept {
 
 
 namespace epoll {
-    struct Poller {
-        const int epfd;
-        int count = 0;
+    using sys::RawFd;
+    struct LT{};
+    struct ET{};
+    constexpr auto use_lt = LT{};
+    constexpr auto use_et = ET{};
 
-        Poller() noexcept: epfd(epoll_create1(0)) {}
+    namespace detail {
+        struct PollerBase {
+            const int epfd;
+            int count = 0;
 
-        Poller(const Poller&) = delete;
-        Poller& operator=(const Poller&) = delete;
-        Poller(Poller&&) = delete;
-        Poller& operator=(Poller&&) = delete;
+            PollerBase() noexcept: epfd(epoll_create1(0)) {}
 
-        ~Poller() noexcept {
-            close(epfd);
-        }
+            PollerBase(const PollerBase&) = delete;
+            PollerBase& operator=(const PollerBase&) = delete;
+            PollerBase(PollerBase&&) = delete;
+            PollerBase& operator=(PollerBase&&) = delete;
 
-        void add(int fd, uint32_t ev, void *ptr) noexcept {
-            epoll_event ex {.events = ev, .data{.ptr = ptr}};
-            if (epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ex) == 0) {
-                ++count;
+            ~PollerBase() noexcept {
+                close(epfd);
             }
-        }
 
-        void remove(int fd) noexcept {
-            if (epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr) == 0) {
-                --count;
+            void add(int fd, uint32_t ev, void *ptr) noexcept {
+                epoll_event ex {.events = ev, .data{.ptr = ptr}};
+                if (epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ex) == 0) {
+                    ++count;
+                }
             }
+
+            void remove(int fd) noexcept {
+                if (epoll_ctl(epfd, EPOLL_CTL_DEL, fd, nullptr) == 0) {
+                    --count;
+                }
+            }
+        };
+    }
+
+    template<typename T = LT>
+    struct Poller: detail::PollerBase {
+        static Poller& instance() {
+            static Poller instance{};
+            return instance;
         }
 
         void start_loop() noexcept {
@@ -307,14 +380,53 @@ namespace epoll {
                 }
             }
         }
+    };
+
+    template<>
+    struct Poller<ET>: detail::PollerBase {
+        struct EventHandle {
+            uint32_t ev;
+            RawFd *rawfd;
+            coroutine_handle<> h;
+        };
+
+        list<EventHandle> pending_list{};
 
         static Poller& instance() {
             static Poller instance{};
             return instance;
         }
+
+        void start_loop() noexcept {
+            vector<epoll_event> events{};
+            events.reserve(1024);
+
+            while(count > 0) {
+                events.resize(count);
+                auto evdata = events.data();
+                
+                int nfds = epoll_wait(epfd, evdata, count, -1);
+
+                for(int i = 0; i < nfds; ++i) {
+                    auto ev = evdata[i];
+                    auto rawfd = static_cast<RawFd*>(ev.data.ptr);
+                    rawfd->set_readiness(ev.events);
+                }
+                for(auto iter = pending_list.begin();
+                    iter != pending_list.end();) {
+                    if (!iter->rawfd->is_ready(iter->ev)) {
+                        ++iter;
+                        continue;
+                    }
+                    iter->h.resume();
+                    iter = pending_list.erase(iter);
+                }
+            }
+        }
     };
 
-    auto ready(int fd, uint32_t ev) noexcept {
+    // LT
+    auto ready(int fd, uint32_t ev, LT = use_lt) noexcept {
         struct Awaiter {
             int fd;
             uint32_t ev;
@@ -323,13 +435,13 @@ namespace epoll {
 
             // register event
             void await_suspend(coroutine_handle<> h) noexcept {
-                auto& poller = Poller::instance();
+                auto& poller = Poller<LT>::instance();
                 poller.add(fd, ev, h.address());
             }
 
             // remove event
             void await_resume() noexcept {
-                auto& poller = Poller::instance();
+                auto& poller = Poller<LT>::instance();
                 poller.remove(fd);
                 if (ev & EPOLLOUT) {
                     close(fd);
@@ -346,47 +458,77 @@ namespace epoll {
         }
     }
 
-    enum class Mode {
-        LT = 0,
-        ET = 1
-    };
 
-    template<Mode mode = Mode::LT>
-    auto readable(int fd) noexcept {
-        if constexpr (mode == Mode::ET) {
-            return ready(fd, EPOLLIN|EPOLLET);
-        } else {
-            return ready(fd, EPOLLIN);
-        }
+    // ET
+    template<typename T>
+    requires concepts::AsRawFd<T>
+    auto ready(T& rawfd, uint32_t ev, ET) noexcept {
+        struct Awaiter {
+            RawFd *rawfd;
+            uint32_t ev;
+
+            bool await_ready() noexcept {
+                return rawfd->is_ready(ev); 
+            }
+
+            void await_suspend(coroutine_handle<> h) noexcept {
+                auto& poller = Poller<ET>::instance();
+                if (!rawfd->is_registered()) {
+                    poller.add(
+                        rawfd->as_raw_fd(),
+                        EPOLLIN|EPOLLOUT|EPOLLET,
+                        rawfd
+                    );
+                }
+                poller.pending_list.emplace_back(
+                    ev, rawfd, h
+                );
+            }
+
+            void await_resume() noexcept {}
+        };
+        return Awaiter{&rawfd, ev};
     }
 
-    template<Mode mode = Mode::LT>
-    auto writable(int fd) noexcept {
-        if constexpr (mode == Mode::ET) {
-            return ready(fd, EPOLLOUT|EPOLLET);
-        } else {
-            return ready(fd, EPOLLOUT);
-        }
+
+    auto readable(int fd, LT = use_lt) noexcept {
+        return ready(fd, EPOLLIN);
+    }
+
+    template<typename T>
+    requires concepts::AsRawFd<T>
+    auto readable(T& rawfd, ET) noexcept {
+        return ready(rawfd, EPOLLIN, use_et);
+    }
+
+    auto writable(int fd, LT = use_lt) noexcept {
+        return ready(fd, EPOLLOUT);
+    }
+
+    template<typename T>
+    requires concepts::AsRawFd<T>
+    auto writable(T& rawfd, ET) noexcept {
+        return ready(rawfd, EPOLLOUT, use_et);
     }
 
     using coro::Task;
-    template<typename T>
+    template<typename T, typename U = LT>
     T block_on(Task<T>&& task) noexcept {
         // take ownership
         Task<T> xtask = std::move(task);
         auto handle = xtask.this_handle;
-        auto& poller = Poller::instance();
+        auto& poller = Poller<U>::instance();
         handle.resume();
         poller.start_loop();
         return handle.promise().get_result();
         // dropped
     }
 
-    template<>
+    template<typename U = LT>
     void block_on(Task<void>&& task) noexcept {
         Task<void> xtask = std::move(task);
         auto handle = xtask.this_handle;
-        auto& poller = Poller::instance();
+        auto& poller = Poller<U>::instance();
         handle.resume();
         poller.start_loop();
     }

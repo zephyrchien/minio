@@ -11,40 +11,47 @@ using std::vector;
 using minio::Task;
 namespace utils = minio::utils;
 namespace epoll = minio::epoll;
-using epoll::Mode::ET;
+using epoll::use_et;
+using minio::sys::RawFd;
 
 constexpr const char* host = "127.0.0.1";
 constexpr int src_port = 10000; 
 constexpr int dst_port = 20000;
 
-int xread(int fd, void *buf, int max)
+int xread(RawFd& rawfd, void *buf, int max)
 {
     int n = 0;
+    int fd = rawfd.as_raw_fd();
     int total = 0;
     while(n < max) {
         n = recv(fd, buf+total, max - total, 0);
         // EWOULDBLOCK or EOF or Error (skip check here..)
-        if (n <=0) break;
-
+        if (n <=0) {
+            rawfd.clear_readiness(EPOLLIN);
+            break;
+        }
         total += n;
     }
     return total;
 }
 
-int xwrite(int fd, void *buf, int max)
+int xwrite(RawFd& rawfd, void *buf, int max)
 {
     int n = 0;
+    int fd = rawfd.as_raw_fd();
     int total = 0;
     while(n < max) {
         n = send(fd, buf+total, max - total, 0);
-        if (n < 0) break;
-
+        if (n < 0) {
+            rawfd.clear_readiness(EPOLLOUT);
+            break;
+        }
         total += n;
     }
     return total;
 }
 
-Task<void> copy(int src, int dst)
+Task<void> copy(RawFd& src, RawFd& dst)
 {
     
     int n = 0;
@@ -53,22 +60,22 @@ Task<void> copy(int src, int dst)
     char *buf = buffer.data();
 
     while(true) {
-        co_await epoll::readable<ET>(src);
+        co_await epoll::readable(src, use_et);
         n = xread(src, buf, 0x4000);
         if (n <= 0) break;
 
         // actually should flush all data here..
-        co_await epoll::writable<ET>(dst);
+        co_await epoll::writable(dst, use_et);
         xwrite(dst, buf, n);
         if (n < 0) break;
     }
 
 }
 
-Task<void> bidi_copy(int src)
+Task<void> bidi_copy(RawFd src)
 {
-    int dst = socket(AF_INET, SOCK_STREAM, 0);
-    utils::set_non_blocking(dst);
+    int dst_fd = socket(AF_INET, SOCK_STREAM, 0);
+    utils::set_non_blocking(dst_fd);
 
     sockaddr_in sa;
     sa.sin_family = AF_INET;
@@ -80,8 +87,10 @@ Task<void> bidi_copy(int src)
     );
 
     cout << "try connect.." << endl;
-    connect(dst, (sockaddr*)&sa, sizeof(sockaddr_in));
-    co_await epoll::writable(dst);
+    connect(dst_fd, (sockaddr*)&sa, sizeof(sockaddr_in));
+    RawFd dst{dst_fd};
+
+    co_await epoll::writable(dst, use_et);
     cout << "connected!" << endl; // or failed
 
     minio::spawn(copy(src, dst));
@@ -105,16 +114,16 @@ Task<void> proxy()
     cout << "listen.." << endl;
     bind(fd, (sockaddr*)&sa, sizeof(sockaddr_in));
     listen(fd, 4);
-
+    RawFd lis_fd{fd};
     while(true) {
-        co_await epoll::readable(fd);
+        co_await epoll::readable(lis_fd, use_et);
         int conn = accept(fd, nullptr, nullptr);
         if (conn < 0) break;
 
         utils::set_non_blocking(conn);
         cout << "accept!" << endl;
 
-        minio::spawn(bidi_copy(conn));
+        minio::spawn(bidi_copy(RawFd{conn}));
     }
 
     close(fd);
